@@ -5,10 +5,11 @@
 > `scripts/publish_actions.py` on every release: do not edit it here, changes land upstream
 > and the next release overwrites this tree. Issues: https://github.com/noru-tech/noru-grc-engineering/issues
 >
-> `uses: noru-tech/noru-enforce-action@v0.7.1` and
-> `uses: noru-tech/noru-grc-engineering/actions/enforce@v0.7.1`
+> `uses: noru-tech/noru-enforce-action@v0.7.2` and
+> `uses: noru-tech/noru-grc-engineering/actions/enforce@v0.7.2`
 > are the same code at the same version. The toolkit the action runs (`scripts/`,
-> `plugins/`, `contract/`) is copied verbatim from that tag.
+> `plugins/`, `contract/`) is copied verbatim from that tag. `@v0`
+> follows the newest 0.x release.
 >
 > The workflow that `repo-enforcement` installs pins the *upstream* path at a full commit
 > SHA, and `/repo-enforcement:verify` recognises only that form. Use this repository for
