@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/noru-tech/noru-grc-engineering/contract/privacy-datamap-review.schema.json",
   "title": "Privacy scan data map, review queue and evidence record",
-  "description": "Cache-only review outputs. Proposed meaning never constitutes acceptance. Markdown views render data_map and review_queue; the evidence JSON preserves all three.",
+  "description": "On-demand review views. Proposed meaning never constitutes acceptance. Markdown renders data_map and review_queue; explicit evidence JSON output includes all three without persisting a duplicate inventory.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,7 +12,8 @@
     "data_map",
     "review_queue",
     "evidence_record",
-    "collection_mode"
+    "collection_mode",
+    "progress"
   ],
   "properties": {
     "version": {
@@ -93,6 +94,63 @@
             "object",
             "null"
           ]
+        },
+        "system_flows": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "dotnet": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "projects": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "solutions": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "technologies": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "relationships": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "diagnostic_summary": {
+              "type": "object"
+            },
+            "runtime_bindings": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "entity_relationships": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "gaps": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -223,6 +281,38 @@
         },
         "relationship_mapping": {
           "type": "object"
+        },
+        "extraction_diagnostics": {
+          "type": "object",
+          "required": [
+            "version",
+            "observed_diagnostics",
+            "resolved_diagnostics",
+            "active_blockers"
+          ],
+          "properties": {
+            "version": {
+              "const": 1
+            },
+            "observed_diagnostics": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "resolved_diagnostics": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "active_blockers": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
         }
       }
     },
@@ -232,6 +322,74 @@
         "candidate"
       ],
       "description": "Whether reviewed observations use manifest bindings or a separately validated proposed graph."
+    },
+    "progress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "collection",
+        "agent_investigation",
+        "agent_pending_fields",
+        "extraction_gaps",
+        "source_information",
+        "missing_facts",
+        "human_approval",
+        "publication",
+        "next_actions"
+      ],
+      "properties": {
+        "collection": {
+          "type": "string"
+        },
+        "agent_investigation": {
+          "type": "string"
+        },
+        "source_information": {
+          "type": "string"
+        },
+        "human_approval": {
+          "type": "string"
+        },
+        "publication": {
+          "type": "string"
+        },
+        "agent_pending_fields": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "extraction_gaps": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "missing_facts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next_actions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "technical_questions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "accepted_uncertainty_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "accepted_uncertainties": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
     }
   }
 }

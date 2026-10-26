@@ -19,9 +19,17 @@ because a signature cannot outlive the structure it was given for. Special-categ
 shorter horizon. `--as-of=YYYY-MM-DD` turns an already-expired claim into an error; leave it off and
 the file is judged on its own terms, so nothing here reads the clock by itself.
 
+A collection may also be owned by an agent, and only to RENEW it: the collection must be, apart from
+its interpretation and its citations, exactly what a person signed at the base revision, the agent
+must act under a grant in the repository's committed .noru/interpretation-policy.yml, and a named
+person answers for it as `operator`. The next renewal after an agent's is a person's. Declarations
+carry no structural anchor, so they stay a person's to sign. `--base` is the manifest at the base
+revision and `--interpretation-policy` the policy as it stood there; CI mode passes both. Without
+`--base` the lineage cannot be checked here and is reported as a warning, never as a pass.
+
 Usage:
     python3 validate_manifest.py <manifest.yml> [--as-of=YYYY-MM-DD] [--output=json] [--quiet]
-        [--emit-parsed=<path>]
+        [--emit-parsed=<path>] [--base=<manifest.yml>] [--interpretation-policy=<path>]
 Exit codes: 0 = valid (warnings allowed), 1 = validation errors, 2 = usage / load error.
 """
 import datetime
@@ -34,6 +42,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import dependencies
 import relationships
 import analysis_cache
+import dataset_inputs
 
 # --- BEGIN VENDORED yaml_mini ---
 # Canonical copy: contract/lib/yaml_mini.py. Every piece validator embeds this block verbatim so
@@ -44,6 +53,7 @@ import analysis_cache
 # otherwise falls back to a built-in parser, so the validator runs anywhere python3 exists with no
 # install step and no network.
 import difflib
+import json
 import re
 
 _BLOCK_SCALAR_RE = re.compile(r"^[>|](?:[+-]\d*|\d*[+-]?)$")  # >, |, >-, |+, >2, |2-, |-2, …
@@ -118,6 +128,13 @@ def _scalar(raw):
     if s in _FALSE_WORDS:
         return False
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        if s[0] == '"':
+            try:
+                return json.loads(s)
+            except ValueError:
+                pass  # Retain the existing subset behavior for non-JSON YAML escapes.
+        if s[0] == "'":
+            return s[1:-1].replace("''", "'")
         return s[1:-1]
     if s.startswith("[") and s.endswith("]"):
         inner = s[1:-1].strip()
@@ -387,22 +404,43 @@ FIDES_KEY_RE = re.compile(r"^[A-Za-z0-9_.<>-]+$")
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
-TOP_LEVEL_KEYS = {"version", "piece", "source", "dataset", "system", "evidence_dependencies", "relationship_graph"}
+import migration_support
+
+TOP_LEVEL_KEYS = {"migration_support", "version", "piece", "source", "dataset", "system", "evidence_dependencies", "relationship_graph"}
 SOURCE_KEYS = {"slug", "commit_sha", "branch", "generated_by", "derived_digest"}
-INTERPRETATION_KEYS = {"owner", "decided_at", "expires_at", "rationale", "refs"}
-DATASET_KEYS = {"fides_key", "name", "description", "collections"}
+INTERPRETATION_KEYS = {
+    "owner", "owner_kind", "operator", "policy_ref", "renews", "decided_at", "expires_at",
+    "rationale", "refs",
+}
+RENEWS_KEYS = {"owner", "decided_at"}
+POLICY_KEYS = {"kind", "version", "grants"}
+GRANT_KEYS = {"id", "piece", "claims", "agents", "operators", "max_days"}
+# The only claim class an agent may hold. The validator enforces it, not the policy file: a policy
+# that grants anything else is itself invalid.
+AGENT_CLAIMS = ["renewal"]
+# Pieces whose owners hold a duty that exists to be held apart from someone else's. No policy can
+# grant an agent anything in them.
+NEVER_AGENT = ("change-control", "audit-pack", "review-signoff")
+# The shapes a team alias usually takes: a forge team handle, a path, or a word naming a group.
+# It catches the common mistakes; the named list of operators in a reviewed policy is the control.
+TEAM_RE = re.compile(
+    r"^@|/|\b(team|teams|squad|group|guild|crew|department|dept|committee|board|admins?|owners|"
+    r"everyone|all|staff|bots?|agents?)\b",
+    re.IGNORECASE,
+)
+DATASET_KEYS = {"fides_key", "name", "description", "collections", "meta"}
 COLLECTION_KEYS = {
     "name", "description", "refs", "interpretation", "needs_review", "fields",
     "non_personal_fields", "structure_digest",
 }
-FIELD_KEYS = {"name", "description", "data_categories", "refs", "needs_review", "fields"}
+FIELD_KEYS = {"name", "description", "data_categories", "refs", "needs_review", "fields", "meta"}
 SYSTEM_KEYS = {
     "fides_key", "name", "description", "system_type", "dataset_references",
-    "privacy_declarations",
+    "privacy_declarations", "meta", "ingress", "egress",
 }
 DECLARATION_KEYS = {
     "name", "data_use", "data_categories", "data_subjects", "refs", "interpretation",
-    "needs_review",
+    "needs_review", "ingress", "egress",
 }
 
 
@@ -446,7 +484,8 @@ def check_refs(rep, path, obj):
             rep.err(f"{path}.refs[{i}]", f"'{ref}' is not a 'file:line' citation")
 
 
-def check_interpretation(rep, path, obj):
+def check_interpretation(rep, path, obj, anchored=False):
+    """Requirement 8. `anchored`: the claim carries a structure_digest, so an agent may renew it."""
     block = obj.get("interpretation")
     if block is None:
         rep.err(
@@ -462,6 +501,19 @@ def check_interpretation(rep, path, obj):
     check_unknown_keys(rep, ipath, block, INTERPRETATION_KEYS)
 
     owner = block.get("owner")
+    kind = block.get("owner_kind", "person")
+    if kind not in ("person", "agent"):
+        rep.err(f"{ipath}.owner_kind", f"'{kind}' is not an owner kind — use person or agent")
+    elif kind == "agent":
+        check_agent_owner(rep, ipath, block, anchored)
+    else:
+        for key in ("operator", "policy_ref", "renews"):
+            if key in block:
+                rep.err(
+                    f"{ipath}.{key}",
+                    f"`{key}` belongs to an agent's renewal; a person who owns a claim answers for "
+                    "it directly",
+                )
     if not owner or not isinstance(owner, str) or len(owner) < 3:
         rep.err(f"{ipath}.owner", "missing or too short — must name a person, not a team alias")
     if block.get("decided_at") is None:
@@ -475,6 +527,60 @@ def check_interpretation(rep, path, obj):
         rep.err(f"{ipath}.rationale", "missing or too short — say why this claim holds")
     if block.get("expires_at") is None:
         rep.warn(f"{ipath}.expires_at", "no expiry set; acceptable only for a point-in-time claim")
+
+
+def check_agent_owner(rep, ipath, block, anchored):
+    """The parts of an agent's renewal the block alone can answer for; check_agent_claims does the rest."""
+    if not anchored:
+        rep.err(
+            f"{ipath}.owner_kind",
+            "an agent may only renew a claim anchored to a structure, and a privacy declaration "
+            "has no structure_digest. A declaration is a person's to sign",
+        )
+        return
+    operator = block.get("operator")
+    if operator is None:
+        rep.err(
+            f"{ipath}.operator",
+            "missing required `operator` — an agent owner needs a named person who can be asked "
+            "what it was thinking",
+        )
+    elif not isinstance(operator, str) or len(operator.strip()) < 3:
+        rep.err(f"{ipath}.operator", "too short — name the person who operates the agent")
+    elif TEAM_RE.search(operator):
+        rep.err(
+            f"{ipath}.operator",
+            f"'{operator}' reads as a team alias — the operator must be a named person, because a "
+            "team cannot be asked anything",
+        )
+    elif operator.strip() == str(block.get("owner", "")).strip():
+        rep.err(f"{ipath}.operator", "is the agent itself — an agent cannot operate itself")
+    if not isinstance(block.get("policy_ref"), str) or not block.get("policy_ref"):
+        rep.err(
+            f"{ipath}.policy_ref",
+            "missing required `policy_ref` — name the grant in .noru/interpretation-policy.yml "
+            "the agent acted under",
+        )
+    renews = block.get("renews")
+    if not isinstance(renews, dict):
+        rep.err(
+            f"{ipath}.renews",
+            "missing required `renews` — an agent may only renew, so name the person's decision "
+            "it renews (owner and decided_at)",
+        )
+    else:
+        check_unknown_keys(rep, f"{ipath}.renews", renews, RENEWS_KEYS)
+        if not isinstance(renews.get("owner"), str) or len(renews["owner"].strip()) < 3:
+            rep.err(f"{ipath}.renews.owner", "missing or too short — name the person who signed")
+        renewed = parse_date(renews.get("decided_at"))
+        decided = parse_date(block.get("decided_at"))
+        if renewed is None:
+            rep.err(f"{ipath}.renews.decided_at", "missing or not an ISO date (YYYY-MM-DD)")
+        elif decided is not None and decided < renewed:
+            rep.err(
+                f"{ipath}.decided_at",
+                "is before the decision it renews — a renewal comes after what it renews",
+            )
 
 
 def check_source(rep, doc):
@@ -526,8 +632,11 @@ def parse_date(value):
         return None
 
 
-def check_horizon(rep, path, block, horizon_days, as_of):
-    """expires_at is required, bounded, and — with --as-of — must not already have passed."""
+def check_horizon(rep, path, block, horizon_days, as_of, agent_days=None):
+    """expires_at is required, bounded, and — with --as-of — must not already have passed.
+
+    `agent_days` is the shorter ceiling an agent's renewal gets, when the owner is an agent.
+    """
     ipath = f"{path}.interpretation"
     decided = parse_date(block.get("decided_at"))
     expires_raw = block.get("expires_at")
@@ -549,7 +658,15 @@ def check_horizon(rep, path, block, horizon_days, as_of):
         )
         return
     days = (expires - decided).days
-    if days > horizon_days:
+    if block.get("owner_kind") == "agent" and agent_days is not None:
+        if days > agent_days:
+            rep.err(
+                f"{ipath}.expires_at",
+                f"stands for {days} days from decided_at; an agent's renewal may stand for at most "
+                f"{agent_days}. The next look after an agent's is a person's, and this ceiling is "
+                "what bounds how long that waits",
+            )
+    elif days > horizon_days:
         rep.err(
             f"{ipath}.expires_at",
             f"stands for {days} days from decided_at; this claim may stand for at most "
@@ -611,7 +728,7 @@ def check_fields(rep, path, fields, vocab, counts):
             rep.err(
                 f"{fpath}.needs_review",
                 "still true — the collector could not classify this field and nobody has. "
-                "Classify the field, or accept it as non-personal so reconciliation can compact "
+                "Classify the field, record scoped accepted uncertainty, or accept it as non-personal so reconciliation can compact "
                 "it into `non_personal_fields`. Then remove the flag",
             )
         elif not cats:
@@ -622,7 +739,7 @@ def check_fields(rep, path, fields, vocab, counts):
                 for child in (field.get("fields") or [])
                 if isinstance(child, dict)
             )
-            if not has_review_child:
+            if not has_review_child and not field.get("meta", {}).get("accepted_uncertainties"):
                 # Accepted 0.8.0 manifests used full empty-category objects. Keep them valid so
                 # reconciliation can compact them without discarding the accepted decision.
                 rep.warn(
@@ -685,7 +802,7 @@ def check_datasets(rep, doc, vocab, counts, as_of):
             # this table". Per-field attribution would be five hundred blocks on a five-hundred
             # column schema, which is a form nobody fills in.
             check_refs(rep, cpath, collection)
-            check_interpretation(rep, cpath, collection)
+            check_interpretation(rep, cpath, collection, anchored=True)
 
             compact = collection.get("non_personal_fields", [])
             if not isinstance(compact, list):
@@ -740,10 +857,11 @@ def check_datasets(rep, doc, vocab, counts, as_of):
 
                 cats = categories(collection.get("fields", []))
                 special = any(c in vocab["special_categories"] for c in cats)
-                horizon = vocab["horizon_days"][
-                    "special_category" if special else "standard"
-                ]
-                check_horizon(rep, cpath, block, horizon, as_of)
+                tier = "special_category" if special else "standard"
+                check_horizon(
+                    rep, cpath, block, vocab["horizon_days"][tier], as_of,
+                    vocab["agent_horizon_days"][tier],
+                )
 
             if collection.get("needs_review") is True:
                 counts["needs_review"] += 1
@@ -756,7 +874,7 @@ def check_datasets(rep, doc, vocab, counts, as_of):
     return keys
 
 
-def check_systems(rep, doc, vocab, dataset_keys, counts, as_of):
+def check_systems(rep, doc, vocab, dataset_keys, counts, as_of, repo=None):
     systems = doc.get("system")
     if systems is None:
         rep.err("system", "missing required `system` (an empty list is a valid answer)")
@@ -800,21 +918,65 @@ def check_systems(rep, doc, vocab, dataset_keys, counts, as_of):
                         + suggest(str(ref), dataset_keys),
                     )
 
+        for direction in ("ingress", "egress"):
+            flows = system.get(direction, [])
+            if not isinstance(flows, list):
+                rep.err(f"{path}.{direction}", "must be a list")
+                continue
+            for flow in flows:
+                if not isinstance(flow, dict) or set(flow) - {"fides_key", "type", "data_categories"} or flow.get("type") != "system" or flow.get("fides_key") not in {s.get("fides_key") for s in systems if isinstance(s, dict)}:
+                    rep.err(f"{path}.{direction}", "flow must reference a system defined in this manifest")
+                elif not isinstance(flow.get("data_categories", []), list) or any(c not in vocab["data_categories"] for c in flow.get("data_categories", [])):
+                    rep.err(f"{path}.{direction}", "flow contains invalid data categories")
+
         declarations = system.get("privacy_declarations")
+        non_personal = system.get('meta', {}).get('non_personal_processing')
+        if non_personal:
+            if not isinstance(non_personal, dict):
+                rep.err(path, 'non_personal_processing must be an evidenced review record')
+            else:
+                if declarations or not non_personal.get('rationale') or not non_personal.get('refs'):
+                    rep.err(path, 'non-personal processing requires rationale, source references and no personal declarations')
+                if non_personal.get('needs_review'):
+                    rep.err(path, 'non-personal processing still needs named-owner review')
+                check_interpretation(rep, path + '.meta.non_personal_processing', non_personal)
+                def personal_or_unknown(fields):
+                    return any(field.get('data_categories') or field.get('needs_review') or field.get('meta', {}).get('accepted_uncertainties')
+                               or personal_or_unknown(field.get('fields', [])) for field in fields)
+                if any(personal_or_unknown(collection.get('fields', [])) for dataset in doc.get('dataset', [])
+                       if dataset['fides_key'] in refs for collection in dataset.get('collections', [])):
+                    rep.err(path, 'non-personal processing conflicts with linked personal or unresolved data')
+                if repo is not None:
+                    import system_review
+                    try:
+                        if non_personal.get('evidence_binding') != system_review.binding(system, non_personal.get('refs', []), repo):
+                            rep.err(path, 'non-personal processing evidence or flows changed; reinvestigate this system')
+                    except (ValueError, OSError, TypeError):
+                        rep.err(path, 'non-personal processing evidence is unavailable')
         if declarations is None:
             rep.err(f"{path}.privacy_declarations", "missing required `privacy_declarations`")
             continue
         if not isinstance(declarations, list):
             rep.err(f"{path}.privacy_declarations", "must be a list")
             continue
+        declaration_names = set()
         for j, decl in enumerate(declarations):
             dpath = f"{path}.privacy_declarations[{j}]"
             if not isinstance(decl, dict):
                 rep.err(dpath, "privacy declaration must be a mapping")
                 continue
             check_unknown_keys(rep, dpath, decl, DECLARATION_KEYS)
+            name = decl.get('name')
+            if isinstance(name, str):
+                if name in declaration_names:
+                    rep.err(f'{path}.privacy_declarations', 'Names must be unique within their parent; split processing into single-purpose activities with distinct names.')
+                declaration_names.add(name)
             if not decl.get("name"):
                 rep.err(f"{dpath}.name", "missing required `name` — say what this processing is for")
+            for direction in ("ingress", "egress"):
+                links = decl.get(direction, [])
+                if not isinstance(links, list) or any(link not in {s.get("fides_key") for s in systems if isinstance(s, dict)} for link in links):
+                    rep.err(f"{dpath}.{direction}", "must list systems defined in this manifest")
             use = decl.get("data_use")
             if not use:
                 rep.err(f"{dpath}.data_use", "missing required `data_use`")
@@ -837,8 +999,10 @@ def check_systems(rep, doc, vocab, dataset_keys, counts, as_of):
                             + suggest(str(subject), vocab["data_subjects"]),
                         )
             cats = check_categories(rep, dpath, decl, vocab)
+            if not cats:
+                rep.err(f"{dpath}.data_categories", "identify the data categories used for this processing purpose before acceptance")
             check_refs(rep, dpath, decl)
-            check_interpretation(rep, dpath, decl)
+            check_interpretation(rep, dpath, decl, anchored=False)
             block = decl.get("interpretation")
             if isinstance(block, dict):
                 special = any(c in vocab["special_categories"] for c in cats)
@@ -880,6 +1044,255 @@ def manifest_structures(doc):
     return structures
 
 
+# `--base=` with no path: a base revision was required and could not be read.
+BASE_UNAVAILABLE = object()
+
+
+def without(node, keys):
+    """`node` with every mapping key in `keys` removed, at any depth."""
+    if isinstance(node, dict):
+        return {k: without(v, keys) for k, v in node.items() if k not in keys}
+    if isinstance(node, list):
+        return [without(v, keys) for v in node]
+    return node
+
+
+def same(left, right, keys):
+    return json.dumps(without(left, keys), sort_keys=True) == json.dumps(
+        without(right, keys), sort_keys=True
+    )
+
+
+def policy_grants(rep, policy, vocab):
+    """Validate the interpretation policy and return this piece's usable grants, by id.
+
+    Judged only when a claim relies on it. A grant for one of the NEVER_AGENT pieces is an error
+    whichever piece reads the file; a grant for any other piece is that piece's validator's to judge.
+    """
+    document, label = policy
+    if not isinstance(document, dict):
+        rep.err(label, "must be a mapping with `kind`, `version` and `grants`")
+        return {}
+    check_unknown_keys(rep, label, document, POLICY_KEYS)
+    if document.get("kind") != "interpretation-policy":
+        rep.err(f"{label}.kind", "must be 'interpretation-policy'")
+    if document.get("version") != 1:
+        rep.err(f"{label}.version", "must be 1")
+    grants = document.get("grants")
+    if not isinstance(grants, list):
+        rep.err(f"{label}.grants", "must be a list")
+        return {}
+    ceiling = vocab["agent_horizon_days"]["standard"]
+    usable = {}
+    seen = set()
+    for i, grant in enumerate(grants):
+        gpath = f"{label}.grants[{i}]"
+        if not isinstance(grant, dict):
+            rep.err(gpath, "must be a mapping")
+            continue
+        check_unknown_keys(rep, gpath, grant, GRANT_KEYS)
+        ok = True
+        gid = grant.get("id")
+        if not isinstance(gid, str) or not KEY_RE.match(gid):
+            rep.err(f"{gpath}.id", f"'{gid}' is not a key ([a-z0-9][a-z0-9._-]*)")
+            ok = False
+        elif gid in seen:
+            rep.err(f"{gpath}.id", f"duplicate grant id '{gid}'")
+            ok = False
+        else:
+            seen.add(gid)
+        piece = grant.get("piece")
+        if piece in NEVER_AGENT:
+            rep.err(
+                f"{gpath}.piece",
+                f"{piece} never accepts an agent owner: its owners hold a duty that exists to be "
+                "held apart from someone else's, and an agent cannot hold it",
+            )
+            continue
+        if piece != PIECE:
+            continue
+        if grant.get("claims") != AGENT_CLAIMS:
+            rep.err(
+                f"{gpath}.claims",
+                "must be [renewal]. An agent may only renew a claim whose structure a person "
+                "signed; new claims, changed claims and drift acknowledgements are a person's, "
+                "and no policy can grant them",
+            )
+            ok = False
+        agents = grant.get("agents")
+        if not isinstance(agents, list) or not agents or not all(
+            isinstance(a, str) and len(a.strip()) >= 3 for a in agents
+        ):
+            rep.err(f"{gpath}.agents", "must list the agent identities this grant covers")
+            ok = False
+            agents = []
+        operators = grant.get("operators")
+        if not isinstance(operators, list) or not operators:
+            rep.err(
+                f"{gpath}.operators",
+                "must name at least one person who answers for the agents under this grant",
+            )
+            ok = False
+        else:
+            for k, operator in enumerate(operators):
+                opath = f"{gpath}.operators[{k}]"
+                if not isinstance(operator, str) or len(operator.strip()) < 3:
+                    rep.err(opath, "missing or too short — name a person")
+                    ok = False
+                elif TEAM_RE.search(operator):
+                    rep.err(
+                        opath,
+                        f"'{operator}' reads as a team alias — an operator must be a named person",
+                    )
+                    ok = False
+                elif operator in agents:
+                    rep.err(opath, f"'{operator}' is also listed as an agent")
+                    ok = False
+        max_days = grant.get("max_days")
+        if isinstance(max_days, bool) or not isinstance(max_days, int) or max_days < 1:
+            rep.err(f"{gpath}.max_days", "must be a whole number of days, at least 1")
+            ok = False
+        elif max_days > ceiling:
+            rep.err(
+                f"{gpath}.max_days",
+                f"{max_days} exceeds this piece's agent ceiling of {ceiling} days; a policy may "
+                "shorten it, never lengthen it",
+            )
+            ok = False
+        if ok:
+            usable[gid] = grant
+    return usable
+
+
+def check_agent_claims(rep, doc, vocab, policy, base):
+    """Every agent-owned collection: inside a grant, and a renewal of what a person signed."""
+    claims = []
+    for i, dataset in enumerate(doc.get("dataset") or []):
+        if not isinstance(dataset, dict):
+            continue
+        for j, collection in enumerate(dataset.get("collections") or []):
+            block = collection.get("interpretation") if isinstance(collection, dict) else None
+            if isinstance(block, dict) and block.get("owner_kind") == "agent":
+                key = (dataset.get("fides_key"), collection.get("name"))
+                claims.append((f"dataset[{i}].collections[{j}].interpretation", key, collection))
+    if not claims:
+        return
+
+    grants = None if policy is None else policy_grants(rep, policy, vocab)
+    before = {}
+    if isinstance(base, dict):
+        for dataset in base.get("dataset") or []:
+            if not isinstance(dataset, dict):
+                continue
+            for collection in dataset.get("collections") or []:
+                if isinstance(collection, dict):
+                    before[(dataset.get("fides_key"), collection.get("name"))] = collection
+
+    for ipath, key, collection in claims:
+        block = collection["interpretation"]
+        check_grant(rep, ipath, block, grants, policy)
+        check_lineage(rep, ipath, collection, before.get(key), base)
+
+
+def check_grant(rep, ipath, block, grants, policy):
+    if grants is None:
+        rep.err(
+            f"{ipath}.policy_ref",
+            "outside the interpretation policy: there is no committed "
+            ".noru/interpretation-policy.yml at the base revision, so no agent may own a claim",
+        )
+        return
+    ref = block.get("policy_ref")
+    grant = grants.get(ref)
+    if grant is None:
+        rep.err(
+            f"{ipath}.policy_ref",
+            f"outside the interpretation policy: {policy[1]} has no valid {PIECE} grant '{ref}'",
+        )
+        return
+    owner = block.get("owner")
+    if owner not in grant["agents"]:
+        rep.err(
+            f"{ipath}.owner",
+            f"outside the interpretation policy: grant '{ref}' does not cover the agent '{owner}'",
+        )
+    operator = block.get("operator")
+    if operator is not None and operator not in grant["operators"]:
+        rep.err(
+            f"{ipath}.operator",
+            f"outside the interpretation policy: grant '{ref}' does not name '{operator}' as an "
+            "operator",
+        )
+    decided = parse_date(block.get("decided_at"))
+    expires = parse_date(block.get("expires_at"))
+    if decided and expires and (expires - decided).days > grant["max_days"]:
+        rep.err(
+            f"{ipath}.expires_at",
+            f"stands for {(expires - decided).days} days; grant '{ref}' lets an agent's renewal "
+            f"stand for at most {grant['max_days']}",
+        )
+
+
+def check_lineage(rep, ipath, collection, prior, base):
+    """The renewal rule. Needs the manifest as it stood at the base revision."""
+    if base is None:
+        rep.warn(
+            ipath,
+            "an agent's renewal is not checked against the base revision without --base. CI mode "
+            "checks it; do not publish it until that check has passed",
+        )
+        return
+    if base is BASE_UNAVAILABLE:
+        rep.err(
+            ipath,
+            "an agent's renewal can only be checked against the base revision, and none could be "
+            "read. Fetch the history the check needs (the base branch, or the parent commit)",
+        )
+        return
+    signed = prior.get("interpretation") if isinstance(prior, dict) else None
+    if not isinstance(signed, dict):
+        rep.err(
+            ipath,
+            "an agent cannot own a new claim: this collection has no signed claim at the base "
+            "revision, so a person must sign it first",
+        )
+        return
+    if same(prior, collection, ("refs",)):
+        # Carried forward unchanged. It was judged against its own base when it was made.
+        return
+    if signed.get("owner_kind") == "agent":
+        rep.err(
+            ipath,
+            "renews an agent's renewal — the next renewal after an agent's is a person's",
+        )
+        return
+    if prior.get("structure_digest") != collection.get("structure_digest"):
+        rep.err(
+            ipath,
+            f"the structure changed since a person last owned it (structure_digest "
+            f"{str(prior.get('structure_digest'))[:12]} at the base revision, "
+            f"{str(collection.get('structure_digest'))[:12]} now) — a changed claim is a person's "
+            "to sign",
+        )
+        return
+    if not same(prior, collection, ("refs", "interpretation")):
+        rep.err(
+            ipath,
+            "the classification changed since a person last owned it — an agent may only renew a "
+            "claim exactly as a person signed it",
+        )
+        return
+    renews = collection["interpretation"].get("renews")
+    if not isinstance(renews, dict) or (renews.get("owner"), renews.get("decided_at")) != (
+        signed.get("owner"), signed.get("decided_at")
+    ):
+        rep.err(
+            f"{ipath}.renews",
+            f"does not name the decision it renews: at the base revision this claim is "
+            f"{signed.get('owner')}'s, decided {signed.get('decided_at')}",
+        )
+
+
 def check_observed_structure(rep, doc, derived):
     observed = observed_structures(derived)
     represented = manifest_structures(doc)
@@ -891,14 +1304,14 @@ def check_observed_structure(rep, doc, derived):
             rep.err("dataset", f"manifest collection '{identity}' is not in the current observation")
             continue
         missing = sorted(observed[identity] - represented[identity])
-        extra = sorted(represented[identity] - observed[identity])
+        extra = sorted(name for name in represented[identity] - observed[identity] if not any(name.startswith(parent + ".") for parent in observed[identity]))
         if missing:
             rep.err(identity, f"observed field(s) missing from fields/non_personal_fields: {', '.join(missing)}")
         if extra:
             rep.err(identity, f"unobserved field(s) present in fields/non_personal_fields: {', '.join(extra)}")
 
 
-def validate(doc, vocab, as_of=None, observed=None, repo=None, allow_discovery_review=False):
+def validate(doc, vocab, as_of=None, observed=None, repo=None, allow_discovery_review=False, allow_semantic_review=False, policy=None, base=None):
     rep = Report()
     counts = {
         "datasets": 0,
@@ -923,9 +1336,16 @@ def validate(doc, vocab, as_of=None, observed=None, repo=None, allow_discovery_r
         rep.err("piece", f"expected '{PIECE}', found '{doc.get('piece')}'")
 
     check_source(rep, doc)
+    for error in migration_support.errors(doc.get("migration_support", [])):
+        rep.err("migration_support", error)
+    for error in dataset_inputs.dependency_gaps(doc):
+        rep.err("evidence_dependencies", error)
     dataset_keys = check_datasets(rep, doc, vocab, counts, as_of)
-    check_systems(rep, doc, vocab, dataset_keys, counts, as_of)
+    check_systems(rep, doc, vocab, dataset_keys, counts, as_of, repo)
+    check_agent_claims(rep, doc, vocab, policy, base)
     if isinstance(observed, dict):
+        if doc.get("migration_support", []) != observed.get("migration_support", []):
+            rep.err("migration_support", "source-role declarations differ from collected evidence; rerun collection")
         check_observed_structure(rep, doc, observed)
     if "relationship_graph" in doc:
         for error in relationships.validate(doc["relationship_graph"], doc.get("evidence_dependencies", [])):
@@ -958,21 +1378,54 @@ def validate(doc, vocab, as_of=None, observed=None, repo=None, allow_discovery_r
                 rep.err("discovery", f"{change['path']}: investigate new code/configuration scope and seal the reviewed baseline before export")
         except (OSError, ValueError, TypeError, KeyError) as error:
             rep.err("discovery", f"cannot verify discovery baseline: {error}")
+    if repo is not None and not allow_semantic_review:
+        try:
+            lock_path = pathlib.Path(repo) / ".noru" / "privacy-datamap.lock.json"
+            lock = json.loads(lock_path.read_text()) if lock_path.is_file() else {}
+            if analysis_cache.semantic_changes(lock.get("semantic_snapshot"), analysis_cache.semantic_snapshot(doc)):
+                rep.err("semantic_review", "privacy meaning narrowed: investigate, review and seal the changed baseline before export")
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            rep.err("semantic_review", f"cannot verify accepted meaning: {error}")
+    if repo is not None:
+        try:
+            import field_review
+            import analysis_storage
+            classification_document = analysis_storage.load(pathlib.Path(repo) / ".noru/.cache/privacy-datamap.analysis.json") or {}
+            classification_observed = observed or field_review.derived_for(classification_document, repo)
+            if classification_observed is None:
+                rep.err("classification_review", "Current classification observations are missing; recollect and investigate before acceptance or export")
+            else:
+                for error in field_review.validate_repository(classification_document, classification_observed, pathlib.Path(repo), require_complete=True, candidate=doc):
+                    rep.err("classification_review", error)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            rep.err("classification_review", "Cannot verify canonical classification: " + str(error))
     counts["datasets"] = len(doc.get("dataset") or [])
     return rep, counts
 
 
 USAGE = (
     "usage: validate_manifest.py <manifest.yml> [--as-of=YYYY-MM-DD] [--output=json] [--quiet] "
-    "[--emit-parsed=<path.json>]\n"
+    "[--emit-parsed=<path.json> | --schema-only] [--base=<manifest.yml>] "
+    "[--interpretation-policy=<path>]\n"
 )
+
+
+def load_side_document(path):
+    """A base manifest or a policy file. An empty file stands for one that did not exist there."""
+    text = pathlib.Path(path).read_text(encoding="utf-8")
+    if not text.strip():
+        return None
+    return load_yaml(text)[0]
 
 
 def main(argv):
     output_json = False
     quiet = False
     emit_parsed = None
+    schema_only = False
     as_of = None
+    base_arg = None
+    policy_arg = None
     positional = []
     for arg in argv:
         if arg == "--output=json":
@@ -983,6 +1436,12 @@ def main(argv):
             quiet = True
         elif arg.startswith("--emit-parsed="):
             emit_parsed = arg.split("=", 1)[1]
+        elif arg == "--schema-only":
+            schema_only = True
+        elif arg.startswith("--base="):
+            base_arg = arg.split("=", 1)[1]
+        elif arg.startswith("--interpretation-policy="):
+            policy_arg = arg.split("=", 1)[1]
         elif arg.startswith("--as-of="):
             as_of = parse_date(arg.split("=", 1)[1])
             if as_of is None:
@@ -1000,6 +1459,9 @@ def main(argv):
         else:
             positional.append(arg)
 
+    if schema_only and emit_parsed is not None:
+        sys.stderr.write("error: --schema-only cannot emit exportable parsed output; use repository validation for acceptance/export\n")
+        return 2
     if len(positional) != 1:
         sys.stderr.write(USAGE)
         return 2
@@ -1018,16 +1480,39 @@ def main(argv):
         sys.stderr.write(f"error: could not load bundled vocabulary ({exc})\n")
         return 2
 
+    # The policy defaults to the one beside the manifest. CI mode passes the base revision's copy,
+    # so a pull request that widens the policy is judged by the policy it would replace.
+    base = None
+    policy = None
+    policy_path = path.parent / "interpretation-policy.yml" if policy_arg is None else policy_arg
+    try:
+        if base_arg == "":
+            base = BASE_UNAVAILABLE
+        elif base_arg is not None:
+            base = load_side_document(base_arg) or {}
+        if policy_path and pathlib.Path(policy_path).is_file():
+            document = load_side_document(policy_path)
+            if document is not None:
+                policy = (document, "interpretation-policy")
+        elif policy_arg:
+            raise OSError(f"no such file: {policy_arg}")
+    except Exception as exc:  # noqa: BLE001
+        sys.stderr.write(f"error: could not read the base manifest or interpretation policy ({exc})\n")
+        return 2
+
     observed = None
     derived_path = path.parent / ".cache" / "privacy-datamap.derived.json"
-    if derived_path.is_file():
+    if not schema_only and derived_path.is_file():
         try:
             observed = json.loads(derived_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             sys.stderr.write(f"error: could not load current derived facts ({exc})\n")
             return 2
 
-    rep, counts = validate(doc, vocab, as_of, observed, path.resolve().parent.parent)
+    rep, counts = validate(
+        doc, vocab, as_of, observed, None if schema_only else path.resolve().parent.parent,
+        policy=policy, base=base,
+    )
     ok = not rep.errors
 
     if ok and emit_parsed:
@@ -1047,6 +1532,7 @@ def main(argv):
                 {
                     "piece": PIECE,
                     "manifest": str(path),
+                    "scope": "schema_only" if schema_only else "repository_classification",
                     "ok": ok,
                     "loader": loader,
                     "counts": counts,
@@ -1062,6 +1548,8 @@ def main(argv):
 
     if not quiet:
         print(f"(parsed with {loader})")
+        if schema_only:
+            print("Schema-only validation: this does not validate classification or permit acceptance/export.")
         for p, m in rep.warnings:
             print(f"  WARN  {p}: {m}")
     for p, m in rep.errors:

@@ -24,6 +24,7 @@ import sys
 # otherwise falls back to a built-in parser, so the validator runs anywhere python3 exists with no
 # install step and no network.
 import difflib
+import json
 import re
 
 _BLOCK_SCALAR_RE = re.compile(r"^[>|](?:[+-]\d*|\d*[+-]?)$")  # >, |, >-, |+, >2, |2-, |-2, …
@@ -98,6 +99,13 @@ def _scalar(raw):
     if s in _FALSE_WORDS:
         return False
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        if s[0] == '"':
+            try:
+                return json.loads(s)
+            except ValueError:
+                pass  # Retain the existing subset behavior for non-JSON YAML escapes.
+        if s[0] == "'":
+            return s[1:-1].replace("''", "'")
         return s[1:-1]
     if s.startswith("[") and s.endswith("]"):
         inner = s[1:-1].strip()
@@ -697,6 +705,43 @@ def run_piece(repo, suite_root, registry_row, as_of):
     }
 
 
+def fail_closed(piece_result, artifact):
+    """A required piece that could not run is a failed gate, whatever else it reported.
+
+    ci_check.py reports a check it could not run as status `error`, and often with no finding at
+    all (a queue-driven collector with no queue, a crashed child). Converting only findings into
+    violations turned that into a pass. And a broken gate's own finding (`coverage` when nothing
+    was parsed) may be one a piece's fail_on omits. So an errored piece always carries a `tooling`
+    finding, which is always gated and never baselineable: it says nothing about the repository,
+    only that the repository was not checked.
+    """
+    if piece_result.get("status") != "error":
+        return piece_result
+    findings = list(piece_result.get("findings") or [])
+    if any(finding.get("kind") == "tooling" for finding in findings):
+        return piece_result
+    culprit = next(
+        (
+            step for step in reversed(piece_result.get("steps") or [])
+            if step.get("status") in ("error", "blocked")
+        ),
+        None,
+    )
+    if culprit is not None:
+        reason = f"{culprit.get('step')}: {culprit.get('detail') or culprit.get('status')}"
+    else:
+        reason = "the check reported an error and no step result"
+    findings.append(
+        {
+            "kind": "tooling",
+            # The fingerprint must not change with a temporary path or a line of stderr.
+            "path": artifact,
+            "message": redact(f"required piece could not run — {reason}"),
+        }
+    )
+    return {**piece_result, "findings": findings}
+
+
 def load_baseline(path):
     if not path.is_file():
         return {"version": 1, "violations": []}, [f"baseline file is missing at {path}"]
@@ -762,7 +807,9 @@ def evaluate(opts):
                 ],
             }
         else:
-            piece_result = run_piece(repo, opts["suite_root"], row, opts["as_of"])
+            piece_result = fail_closed(
+                run_piece(repo, opts["suite_root"], row, opts["as_of"]), row["artifact"]
+            )
         piece_results.append(piece_result)
         allowed = set(config.get("fail_on") or [
             "drift", "invalid", "needs_review", "missing_interpretation", "expired",

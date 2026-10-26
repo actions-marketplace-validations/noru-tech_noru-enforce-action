@@ -42,12 +42,26 @@
       "diff_read_tools": ["findOrganization", "getOrganizationEvidence", "getSecurityFindings"],
       "needs_input": ["review window", "forge export access"]
     },
+    "dev-agents": {
+      "manifest": ".noru/dev-agents.yml",
+      "scan_command": "/dev-agents:scan",
+      "diff_command": "/dev-agents:diff",
+      "scan_read_tools": ["getOrganizationControls", "getControlContext"],
+      "diff_read_tools": ["findOrganization", "getOrganizationVendors", "getOrganizationEvidence"]
+    },
     "evidence-push": {
       "manifest": ".noru/evidence-push.yml",
       "scan_command": "/evidence-push:scan",
       "diff_command": "/evidence-push:diff",
       "scan_read_tools": ["getOrganizationControls", "getControlContext", "getEvidenceItems"],
       "diff_read_tools": ["findOrganization", "getOrganizationEvidence"]
+    },
+    "findings-ingest": {
+      "manifest": ".noru/findings-ingest.yml",
+      "scan_command": "/findings-ingest:scan",
+      "diff_command": "/findings-ingest:diff",
+      "scan_read_tools": ["getSecurityFindings", "getOrganizationAssets", "getOrganizationRisks", "getRiskTreatments"],
+      "diff_read_tools": ["findOrganization", "getSecurityFindings"]
     },
     "governance-records": {
       "manifest": ".noru/governance-records.yml",
@@ -75,6 +89,13 @@
         "getPrivacyTaxonomy",
         "listPrivacyDatasets"
       ]
+    },
+    "threat-model": {
+      "manifest": ".noru/threat-model.yml",
+      "scan_command": "/threat-model:scan",
+      "diff_command": "/threat-model:diff",
+      "scan_read_tools": ["getOrganizationRisks", "getOrganizationControls"],
+      "diff_read_tools": ["findOrganization", "getOrganizationRisks", "getRiskControlMappings"]
     },
     "review-signoff": {
       "manifest": ".noru/review-signoff.yml",

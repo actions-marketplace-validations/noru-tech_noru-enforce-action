@@ -15,7 +15,6 @@
     "deterministic": true,
     "network": false,
     "inputs": [
-      ".noru/privacy-datamap-stores.json",
       ".noru/.cache/privacy-datamap-queue.json"
     ]
   },
@@ -79,6 +78,10 @@
           "expect_message": "duplicate dataset key"
         },
         {
+          "path": "fixtures/invalid-duplicate-declaration-name.privacy-datamap.yml",
+          "expect_message": "Names must be unique within their parent"
+        },
+        {
           "path": "fixtures/invalid-structure-changed.privacy-datamap.yml",
           "expect_message": "no longer a statement about this table"
         },
@@ -97,6 +100,60 @@
         {
           "path": "fixtures/invalid-special-category-horizon.privacy-datamap.yml",
           "expect_message": "may stand for at most"
+        },
+        {
+          "path": "fixtures/invalid-agent-no-operator.privacy-datamap.yml",
+          "expect_message": "missing required `operator`",
+          "agent_case": "no_operator",
+          "args": [
+            "--base=fixtures/valid.privacy-datamap.yml",
+            "--interpretation-policy=fixtures/agent-interpretation-policy.yml"
+          ]
+        },
+        {
+          "path": "fixtures/invalid-agent-team-operator.privacy-datamap.yml",
+          "expect_message": "reads as a team alias",
+          "agent_case": "team_alias_operator",
+          "args": [
+            "--base=fixtures/valid.privacy-datamap.yml",
+            "--interpretation-policy=fixtures/agent-interpretation-policy.yml"
+          ]
+        },
+        {
+          "path": "fixtures/invalid-agent-outside-policy.privacy-datamap.yml",
+          "expect_message": "outside the interpretation policy",
+          "agent_case": "outside_policy",
+          "args": [
+            "--base=fixtures/valid.privacy-datamap.yml",
+            "--interpretation-policy=fixtures/agent-interpretation-policy.yml"
+          ]
+        },
+        {
+          "path": "fixtures/invalid-agent-above-ceiling.privacy-datamap.yml",
+          "expect_message": "an agent's renewal may stand for at most",
+          "agent_case": "above_agent_ceiling",
+          "args": [
+            "--base=fixtures/valid.privacy-datamap.yml",
+            "--interpretation-policy=fixtures/agent-interpretation-policy.yml"
+          ]
+        },
+        {
+          "path": "fixtures/invalid-agent-structure-changed.privacy-datamap.yml",
+          "expect_message": "the structure changed since a person last owned it",
+          "agent_case": "structure_changed",
+          "args": [
+            "--base=fixtures/valid.privacy-datamap.yml",
+            "--interpretation-policy=fixtures/agent-interpretation-policy.yml"
+          ]
+        },
+        {
+          "path": "fixtures/invalid-agent-new-claim.privacy-datamap.yml",
+          "expect_message": "an agent cannot own a new claim",
+          "agent_case": "new_claim",
+          "args": [
+            "--base=fixtures/valid.privacy-datamap.yml",
+            "--interpretation-policy=fixtures/agent-interpretation-policy.yml"
+          ]
         }
       ]
     }
@@ -139,7 +196,7 @@
     "source": [
       {
         "kind": "repository",
-        "note": "The schemas, models, migrations and API contracts the repository actually contains. This half of the queue is repo-resident truth: no server-side integration can see which columns exist on a branch that has not merged, and no API key can read a migration."
+        "note": "The current schemas, models and API contracts the repository actually contains. Migration history is excluded. This half of the queue is repo-resident truth: no server-side integration can see which columns exist on a branch that has not merged."
       },
       {
         "kind": "mcp_tool",
@@ -159,17 +216,28 @@
     ],
     "hardcoded_expectations": false
   },
+  "state": {
+    "headless": false,
+    "reason": "The snapshot leaves `datamap` out entirely when Noru holds nothing for this source, and narrows datasets to this source. Those are decisions about what the tools return, which a fixed list of reads cannot express."
+  },
   "interpretation": {
     "required": true,
     "level": "per_claim",
-    "unattributed": "error"
+    "unattributed": "error",
+    "agent_owners": {
+      "claims": [
+        "renewal"
+      ],
+      "anchor": "structure_digest",
+      "policy": ".noru/interpretation-policy.yml"
+    }
   },
   "ci": {
     "output_json": true,
     "quiet": true,
     "validate": { "runtime": "python3", "entrypoint": "scripts/validate_manifest.py", "arguments": ["{manifest}", "--output=json", "--quiet"] },
     "drift_check": { "runtime": "node", "entrypoint": "scripts/collect.mjs", "arguments": ["--repo={repo}", "--check", "--output=json", "--quiet"] },
-    "watch_paths": ["**/*.sql", "**/drizzle.config.*", "**/*.prisma", "**/*.py", "**/*.proto", "**/*.graphql", "**/*.gql", ".noru/privacy-datamap-stores.json", ".noru/privacy-datamap.yml"],
+    "watch_paths": ["**/*.sql", "**/drizzle.config.*", "**/*.prisma", "**/*.py", "**/*.proto", "**/*.graphql", "**/*.gql", ".noru/privacy-datamap.yml"],
     "exit_codes": {
       "0": "success",
       "1": "drift, validation failure, an unresolved needs_review claim, or a stale plan",

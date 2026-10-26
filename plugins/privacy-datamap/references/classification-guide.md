@@ -1,14 +1,9 @@
 # Classification guide
 
-For the half of the work the collector cannot do.
-
-`classification.json` holds the names that mean the same thing in **every** schema — `email`,
-`password_hash`, `last_login_ip`. The collector applies that table mechanically, which is what lets
-it be deterministic, and marks everything else `needs_review: true`.
-
-This file is for those. It is guidance for a judgement, not a lookup table, and that is why it is
-prose the agent reads rather than data the collector applies. If a rule here ever becomes true in
-every schema regardless of context, move it into `classification.json` instead.
+Classification is a plugin-owned investigation of value meaning, person association and category fit.
+`classification.json` supplies field-name hints only. Its legacy `exact` key does not authorize any
+classification: `email` can be a shared mailbox, `fingerprint` a file checksum, and `race` a sporting
+event. Every observed field enters the canonical evidence review, including operational-looking names.
 
 Every key below was checked against the bundled snapshot in `references/taxonomy/`. That snapshot is
 the offline floor; where you can reach Noru, `getPrivacyTaxonomy` is the truth. **Never invent a
@@ -16,8 +11,8 @@ key** — if the one you want does not exist, the answer is a different key or a
 
 ## Principles
 
-1. **Most-specific wins.** A column literally named `email` is `user.contact.email`, not
-   `user.contact`.
+1. **Most-specific wins.** An evidenced individual email address uses `user.contact.email`, not
+   `user.contact`. The name alone is insufficient.
 2. **A field can carry several categories.** A `billing_address` blob may warrant
    `user.contact.address.street` + `.city` + `.postal_code`.
 3. **Operational columns are not personal data when their context proves it.** Timestamps,
@@ -26,10 +21,104 @@ key** — if the one you want does not exist, the answer is a different key or a
    `user.*` label onto operational data, and do not dismiss context-sensitive data without reading
    its collection and usage.
 4. **A wrong label is worse than an unresolved one.** The unresolved one gets reviewed. The wrong
-   one gets signed, and then it is in the record with somebody's name against it. If you cannot
-   tell, say so and ask.
+   one gets signed, and then it is in the record with somebody's name against it. If source investigation cannot
+   resolve meaning, retain the specific gap. Ask only for business context unavailable from code.
+
+## Field-level classification policy
+
+### Decision vocabulary and shared reasoning
+
+`identification_basis` and `security_sensitivity` are descriptive strings, not closed enums in
+the current gate. Do not mistake accepted spelling for evidence of a correct decision. Preferred
+identification-basis terms are `direct` (identifies a person), `relational` (association through
+an evidenced link), `content` (information about a person), `operational` (evidenced non-personal
+operation) and `unestablished` (still unknown). The `relational` value additionally checks known
+foreign-key target classifications. Security descriptions can use `credential_or_secret`,
+`potential_credential_or_protocol_value` and `not_established`; security sensitivity is separate
+from person association and does not establish a personal-data category.
+
+For repeated semantic analysis, submit an envelope with `reasoning_groups` and `decisions` to
+`investigate.py --decisions`. A group contains `semantic_review`; each decision selects it with
+`reasoning_group` and can override individual dimensions. See [enrichment reuse](enrichment-reuse.md)
+for the JSON shape. Meaning, person association, categories and evidence remain field-specific;
+sharing reasoning never classifies an entire collection automatically.
+
+Use this policy for contextual enrichment. Fides categories describe both identifiers and
+information about a person; do not present every `user.*` category as a direct identifier or
+collapse the distinction into an unexplained PII flag.
+
+For each proposed field, establish its meaning from the schema and write/read path, establish
+whether it identifies or describes a natural person, and cite the evidence for the chosen category.
+A foreign key can establish linkage, but is not required: serializers, lookup paths and attribution
+can establish personal association too. Linkage or proximity alone does not explain a field's meaning.
+Never assign `user.account` or `user.behavior` to every remaining field in a person-related table.
+Never infer human activity merely from a timestamp suffix or a row update.
+
+| Field meaning | Proposed treatment | Exclusion or uncertainty |
+|---|---|---|
+| Identifier for a person or individual account | `user.unique_id`, including opaque join keys | Organization and service identities are distinct from individuals. Task, record and catalogue keys require lookup, correlation and attribution investigation; mixed principals remain explicit. |
+| Role or permission assigned to an individual | `user.authorization` when it describes access | Role definitions, permission catalogues and organization-wide requirements are non-personal. An employment title uses `user.job_title`. |
+| Individual MFA enrolment or exemption state | `user.authorization` | A global MFA requirement is configuration. Free-text exemption reasons require a separate content assessment. |
+| Individual training completion or policy acknowledgement | `user.behavior` for the evidenced completion/acknowledgement event or state | Course/policy definitions and generic processing statuses are non-personal. Assignment and due dates alone do not prove behaviour. |
+| Individual login or activity event | `user.behavior` for the event; classify its identifiers separately | Background tasks, synthetic probes and unattributable operational metrics are non-personal. |
+| Identifier linking requests to an individual session | `user.unique_id`; `user.authorization.credentials` if it authenticates access | Background-process correlation IDs without an individual association are non-personal. Do not collect credential values. |
+| Generic record-maintenance timestamps such as `created_at` and `updated_at` | Investigate producers, defaults, consumers and personal association; no automatic non-personal default | Lack of a collected writer is missing evidence, not proof of non-personal meaning. Bookkeeping and individual events require separate assessments. |
+| Event timestamps such as `completed_at` or `last_active_at` | Review the event and person linkage before proposing `user.behavior` | Timestamp names alone do not establish personal data. Expiry, synchronization, scheduling and maintenance do not by themselves establish behaviour. |
+| Free text, documents or JSON payloads | Propose supported content categories when the contract or usage establishes personal content | Mark possible personal content as ambiguous when the evidence cannot establish its meaning; do not assert every value contains personal information or infer a specific sensitive category. |
+
+These are mapping conventions and evidence requirements, not claims that technical metadata can
+never relate to a person. Keep non-personal fields in the audit inventory even when omitted from
+Fides export. Do not silently change accepted classifications: use the existing reconciliation,
+proposal, semantic-change and acceptance workflow for any correction.
+
+Reusable classification policy belongs in this plugin. Repository-specific evidence and proposals
+belong in the analysis cache. Do not introduce private helper scripts or collection-wide fallback
+rules as an alternative policy. Batching proposals is acceptable only when each field retains its
+own supported meaning and rationale. Unknown meaning remains ambiguous; completeness checks do not
+establish semantic correctness. These guidelines require agent judgment and human review; the
+deterministic gate does not prove that an agent followed them.
+
+## Evidence before category selection
+
+Record these distinctions in `classification_review` within the existing analysis cache, using the
+plugin decision API, source evidence and confidence. They are agent investigation requirements;
+structural validation does not establish the semantic truth of a rationale:
+
+- **Meaning and shape:** inspect the type and serialized value. An account-sounding field may be
+  a boolean, a foreign key or an object. Read its write path before choosing a category.
+- **Identification basis:** distinguish direct identification, relational identification,
+  person-linked attributes/events, and content-dependent identification. Name the referenced
+  identity entity and explain why it represents people; distinguish service accounts and companies.
+  A join establishes linkage, not the semantic category of every other column on that row.
+- **Category fit:** read the bundled category description and choose the most specific category
+  supported by the value's meaning. Do not use a broad ancestor to hide unresolved category fit.
+  `user.authorization` describes scope of
+  permissions and access; it is not a catch-all for OAuth protocol artifacts. A user-linked nonce,
+  verifier digest or transaction reference may have established personal linkage but an unresolved
+  taxonomy mapping. Preserve both facts instead of changing it to non-personal or inventing a key.
+- **Security sensitivity:** credentials and secrets require protection independently of whether
+  they identify people. Do not infer personal status from secrecy, or credential status from a
+  cryptographic-looking value. Never inspect production secrets to settle this distinction.
+- **Attribution and purpose:** distinguish an actual person event from provenance/source labels,
+  expiry and bookkeeping. Browser-local settings require evidence of identifiable attribution;
+  origin-local storage alone does not establish it. A marketing profile is not necessarily a
+  user-selected setting. Use `user.demographic.profile` only when profile meaning is evidenced.
+
+The collector never assigns personal meaning from a name. Compiler-backed evidence resolves supported
+TypeScript aliases, imports and object/array members; opaque or open shapes remain explicit gaps.
+For composite values, model evidenced members separately and retain unknown-member questions.
+Withdrawing an overbroad parent category does not remove known personal members from scope.
+Distinguish **unmodeled known personal members**, **unknown content**, **unknown identity linkage**
+and **unresolved category fit** in the question and resolution; do not present all four as unknown
+PII presence. Complete code-resolvable modeling as agent work before requesting business context.
+A review-ready flag checks the recorded investigation, not its semantic truth or acceptance.
 
 ## Names that need context, not a lookup
+
+Corporate geography (`city`, `country`, `country_code`, `state`), `display_name`, `national_id`,
+`website` and `homepage` require context and enter the proposal queue. A company address, display
+label or website is not automatically a person attribute. A registration number requires evidence
+of whether it identifies a legal entity or an individual, including sole traders.
 
 These are the ones that reach you, and they are all cases where the same name means different things
 in different schemas.
@@ -39,13 +128,44 @@ in different schemas.
 | `name` | Whose name? On `products` or `tags` it is not personal data at all. On a person row, `user.name`. |
 | `id`, `uuid`, `account_id`, `customer_id` | `user.unique_id` **only when the row identifies a person or their account**. A join key to a non-person table is operational. |
 | `status`, `enabled`, `is_active` | State on a person, account, subscription or activity record may describe behaviour or account settings. A service-health or migration flag may be operational. |
-| `role` | Usually an RBAC role (`admin`, `member`) → `user.account` or `system.operations`. `user.job_title` only if the surrounding model is clearly about employment. |
+| `role` | An individual access assignment can be `user.authorization`; a role catalogue definition is non-personal. Use `user.job_title` only for an employment title. |
 | `title` | A job title, a document title, or a salutation. Read the neighbours. |
 | `address` | A postal address (`user.contact.address.*`), an email address, or a wallet/IP address. |
 | `location` | `user.location.precise` for coordinates, `user.location.imprecise` for a region or city-level guess. |
 | `notes`, `comment`, `bio`, `description` | Free text a person wrote: `user.content.public` or `user.content.private` depending on who can see it. Free text *about* a person may hold anything, including Article 9 data — flag it. |
 | `token`, `key`, `secret` | `user.authorization.credentials` if it authenticates a person; `system.operations` if it is an idempotency key or a feature flag. |
 | `age` | `user.demographic.age_range` for a bucket, `user.demographic.date_of_birth` if it is derived from one. |
+
+## Contextual examples and limits
+
+Use `classification-examples.json` as worked examples for agent reasoning, not as automatic
+field-name rules. The examples are synthetic and inspired by Ethyca's
+[CookieHouse dataset](https://github.com/ethyca/fides-cicd-quickstart/blob/302b394e28ef713a1531ada541dbe3dc63fcb9e6/.fides/cookiehouse_core.yml).
+That quickstart demonstrates CI coverage and policy checks; its individual annotations are not a
+universal classification authority. In particular, do not copy its operational email annotation or
+its inconsistent timestamp treatment as general rules.
+
+Establish these distinctions from current schemas and relevant producers/consumers:
+
+- **Person identity versus record identity:** a customer or employee key can identify a natural
+  person; a product, address or order key identifies a record. Investigate lookup, correlation and
+  attribution before deciding whether that record key also identifies a person. A foreign key
+  proves a relationship, not the meaning of every field in the joined row.
+- **Value meaning versus table proximity:** a product label is not a person's name. An order's
+  customer reference and product reference have different meanings even though they share a row.
+- **Specific content categories:** use the most specific supported address component categories
+  once the address is established as a person's contact address. Corporate geography is not
+  automatically an individual's address.
+- **Relationships versus categories:** Fides relationship and identity metadata supports traversal
+  and matching. It does not substitute for `data_categories` or make an operational label proof
+  that the record has no privacy relevance.
+- **Events versus bookkeeping:** login/visit times need context about the event and its subject.
+  Do not generalize an example timestamp label to every timestamp. Likewise, aggregate counts
+  require evidence of their aggregation scope; a count on a person row may describe that person.
+
+Use these examples alongside the canonical field-review workflow. Tests check taxonomy validity,
+expected distinctions in the examples, and that context-sensitive field names remain queued for
+agent review; tests cannot prove an agent's semantic judgment correct.
 
 ## Signals the exact table deliberately leaves out
 
@@ -143,3 +263,55 @@ signals, all visible in code:
 
 An import is evidence of a flow, not proof of one: a client that is constructed and never called
 sends nothing. Cite the line, say what you found, and let the person who knows the service decide.
+
+## Modeled semantics and execution
+
+### Consistency across related fields
+
+Compare related fields using their evidenced meaning. An invoice reference and an `invoice_issued`
+event attributed to an individual can both support `user.financial`, even in an analytics store.
+The analytics purpose does not turn billing information into generic `user` data or establish
+customer behavior. Check the corresponding activity categories when proposing a field correction;
+preserve its supported purpose, subjects and relationships.
+
+For individual/company branches, record `personal_data: mixed` when the evidence establishes both
+personal and non-personal cases. Explain the discriminator and the personal branch supporting each
+category in the existing review rationale. A category on a mixed field describes possible personal
+values, not every record. Company-only data requires its own association analysis; a company label
+does not rule out a named individual contact or a sole trader.
+
+Use broad `user` only when investigation supports personal meaning without a narrower supported
+category, and explain that choice. Opaque syntax alone does not make an invoice identifier generic.
+For unconstrained person-associated messages, document titles and uploaded content, `user.content`
+can capture the supported meaning. Note possible sensitive submissions in review rationale without
+asserting a sensitive subtype or a public/private audience that the evidence does not establish.
+See the paired scenarios in `classification-examples.json`; these are guidance, not name rules.
+
+Use the same meaning and person-association standard for real implementations, mocks and fixtures.
+Describe modeled information first, then separately identify implemented, simulated and absent
+storage/transmission operations. Constants and discarded records do not establish that modeled
+personal fields are non-personal. Investigate record identifiers through lookup, correlation and
+attribution consumers. Distinguish person actions from system outcomes and bookkeeping; association
+with a user cannot alone support `user.behavior`. Hash inputs and uses, not cryptographic appearance,
+establish whether a digest represents a file, a person-derived identifier, a biometric or a credential.
+
+Complete the API's six `semantic_review` findings with current evidence for each field decision.
+Maintain explicit unknowns: what is known, what evidence is absent, and which conclusion depends
+on it. No broad category or approval substitutes for missing evidence.
+
+## Containers and contradictory category claims
+
+An empty category list on an object is not an uncategorized-value finding when its reviewed
+members carry the classifications. Review all nested members and unresolved/open content before
+calling the container covered. Keep known-member categories on those members in the Fideslang export.
+For source-evidenced arbitrary additional content, `reviewed_open_content` may carry a separately
+justified content category on the container, including when no named members exist. Record
+`residual_uncertainty` and cited evidence; the exported description preserves the open-content
+risk. Do not invent children or claim values are bounded to satisfy review.
+
+A declared delivery or queue state does not establish demographic information. The consistency
+gate rejects a resolved demographic category when the decision's meaning explicitly describes
+such a state. Revisit the producer and consumers, correct the meaning/category with evidence, or
+record unresolved category fit while preserving any established personal association. It does not
+infer a replacement category or treat a field name as evidence. This narrow check is not a general
+semantic classifier: other category/meaning mismatches still require agent review.

@@ -62,7 +62,9 @@ export function toFideslang(manifest) {
     if (node && typeof node === "object") {
       return Object.fromEntries(
         ordered(Object.entries(node).filter(([key]) => !BOOKKEEPING.has(key))).map(
-          ([key, value]) => [key, strip(value)],
+          ([key, value]) => [key, key === "meta" && value && typeof value === "object"
+            ? Object.fromEntries(Object.entries(value).filter(([name]) => name !== "noru").map(([name, child]) => [name, strip(child)]))
+            : strip(value)],
         ),
       );
     }
@@ -70,7 +72,7 @@ export function toFideslang(manifest) {
   };
   const projectField = (field) => {
     const children = (field.fields ?? []).map(projectField).filter(Boolean);
-    const privacyRelevant = (field.data_categories ?? []).length > 0;
+    const privacyRelevant = (field.data_categories ?? []).length > 0 || (field.meta?.accepted_uncertainties ?? []).length > 0;
     if (!privacyRelevant && children.length === 0) return null;
     const projected = strip(field);
     if (children.length > 0) projected.fields = children;
@@ -84,7 +86,7 @@ export function toFideslang(manifest) {
       const fields = (collection.fields ?? []).map(projectField).filter(Boolean);
       return fields.length > 0 ? [{ ...strip(collection), fields }] : [];
     });
-    return collections.length > 0 ? [{ ...strip(dataset), collections }] : [];
+    return collections.length > 0 || (dataset.meta?.accepted_uncertainties ?? []).length > 0 ? [{ ...strip(dataset), collections }] : [];
   });
   const datasetKeys = new Set(datasets.map((dataset) => dataset.fides_key));
   const systems = (manifest.system ?? []).map((system) => ({
